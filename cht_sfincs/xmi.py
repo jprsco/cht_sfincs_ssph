@@ -6,7 +6,7 @@ real-time control coupling (weirs and pumps).
 """
 
 import pathlib as pl
-from ctypes import POINTER, byref, c_double, c_int
+from ctypes import POINTER, byref, c_char_p, c_double, c_int
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -38,15 +38,36 @@ class SfincsXmi(XmiWrapper):
     def get_domain(self) -> None:
         """Retrieve the SFINCS domain arrays (coordinates, water levels, bed levels).
 
+        For subgrid runs ``self.subgrid_z_zmin`` is populated (live pointer
+        into the kernel's subgrid minimum-bed array) and ``self.subgrid`` is
+        set to ``True``; for non-subgrid runs ``self.zb`` is populated and
+        ``self.subgrid`` is ``False``.
+
         Returns
         -------
         None
         """
         self.get_xz_yz()
         self.get_zs()
-        self.get_zb()  # Does not work for subgrid!
+        # Detect subgrid vs non-subgrid by checking which bed-level array the
+        # kernel exposes with a non-zero shape.  In subgrid mode `zb` is not
+        # allocated; in non-subgrid mode `subgrid_z_zmin` is not allocated.
+        self.subgrid = False
+        try:
+            zmin_shape = self.get_var_shape("subgrid_z_zmin")
+            if zmin_shape is not None and int(zmin_shape[0]) > 0:
+                self.get_subgrid_z_zmin()
+                self.subgrid = True
+        except Exception:
+            self.subgrid = False
+        if self.subgrid:
+            # In subgrid mode there is no `zb` array; expose
+            # `subgrid_z_zmin` under the `zb` name as well so external
+            # scripts can read "the bed level" without branching on mode.
+            self.zb = self.subgrid_z_zmin
+        else:
+            self.get_zb()
         self.get_qext()
-        # self.zbini = self.zb[:].copy()
 
     def reset_qext(self) -> None:
         """Reset all external flux values to zero.
@@ -127,6 +148,20 @@ class SfincsXmi(XmiWrapper):
         """
         self.zb = self.get_value_ptr("zb")
 
+    def get_subgrid_z_zmin(self) -> None:
+        """Retrieve a pointer to the subgrid minimum cell-centre bed level array.
+
+        Only valid for subgrid runs.  The pointer stays in sync with the
+        kernel's ``subgrid_z_zmin``, which is mutated in place by
+        ``update_bed_level`` when an external delta is applied via
+        ``dzbext``.
+
+        Returns
+        -------
+        None
+        """
+        self.subgrid_z_zmin = self.get_value_ptr("subgrid_z_zmin")
+
     def get_zs(self) -> None:
         """Retrieve a pointer to the water level array at the current time step.
 
@@ -154,6 +189,35 @@ class SfincsXmi(XmiWrapper):
         """
         self.uorb = self.get_value_ptr("uorb")
 
+    def _set_logical(self, flag_name: str, value: bool) -> None:
+        """Toggle a boolean flag in the SFINCS kernel via the BMI.
+
+        Parameters
+        ----------
+        flag_name : str
+            Kernel-side flag name (e.g. ``"qext"`` or ``"dzbext"``).
+        value : bool
+            ``True`` to enable the flag, ``False`` to disable it.
+        """
+        ival = (c_int * 1)(1 if value else 0)
+        self._execute_function(
+            self.lib.set_logical, c_char_p(flag_name.encode("utf-8")), ival
+        )
+
+    def get_dzbext(self) -> None:
+        """Enable and retrieve a pointer to the external delta-bed-level array.
+
+        Toggles ``use_dzbext`` on in the kernel (which lazily allocates the
+        array on first enable) and stores a NumPy view of it in
+        ``self.dzbext``.
+
+        Returns
+        -------
+        None
+        """
+        self._set_logical("dzbext", True)
+        self.dzbext = self.get_value_ptr("dzbext")
+
     def set_bed_level(
         self,
         x: np.ndarray | None = None,
@@ -163,6 +227,15 @@ class SfincsXmi(XmiWrapper):
         update_water_level: bool = False,
     ) -> None:
         """Set the bed level by interpolating scattered (x, y, z) data to the grid.
+
+        The new absolute bed is interpolated from the supplied scatter, the
+        delta against the live kernel-side baseline is written into
+        ``self.dzbext``, and the kernel applies it via ``update_bed_level``.
+
+        For non-subgrid models the baseline is ``self.zb``; for subgrid
+        models it is ``self.subgrid_z_zmin``.  Both are live pointers into
+        the kernel and are mutated in place by ``update_bed_level``, so no
+        Python-side cache of the previous bed is needed.
 
         Parameters
         ----------
@@ -184,30 +257,40 @@ class SfincsXmi(XmiWrapper):
         """
 
         if x is None or y is None or z is None:
-            # Assume that z
             return
 
-        # New bed level z
+        if not hasattr(self, "dzbext"):
+            self.get_dzbext()
+
+        # New absolute bed level
         zb = interp2(x, y, z, self.xz, self.yz)
 
-        # Replace NaNs in zb with zeros
+        # Replace NaNs with zeros
         zb[np.isnan(zb)] = 0.0
 
         if zb0 is not None:
-            # Make a copy of zb0
             zb = zb0[:].copy() + zb
 
-        # Difference w.r.t. previous time step
-        dzb = zb - self.zb
+        # Baseline absolute bed: live kernel pointer, mutated in place by
+        # update_bed_level.  Subgrid mode: subgrid_z_zmin (cell-centre min);
+        # non-subgrid: zb.
+        if getattr(self, "subgrid", False):
+            zb_prev = np.asarray(self.subgrid_z_zmin[:])
+        else:
+            zb_prev = np.asarray(self.zb[:])
 
-        # Set new bed level
-        self.zb[:] = zb
+        # Delta to push to the kernel
+        dzb = (zb - zb_prev).astype(np.float32, copy=False)
+
+        # Stash the delta in the kernel-side dzbext array, then apply
+        self.dzbext[:] = dzb
+        self.update_bed_level()
 
         if update_water_level:
             self.zs += dzb
 
-        # Update uv points in SFINCS
-        self.update_zbuv()
+        # Reset dzbext so subsequent calls start from a clean slate
+        self.dzbext[:] = 0.0
 
     def set_bed_level_change(
         self,
@@ -218,7 +301,11 @@ class SfincsXmi(XmiWrapper):
     ) -> None:
         """Apply a bed level change relative to the initial bed level.
 
-        Useful for simulating dynamic faulting or landslides.
+        Useful for simulating dynamic faulting or landslides.  The supplied
+        change is interpolated to the grid and pushed to the kernel via
+        ``self.dzbext`` and ``update_bed_level``; this routine no longer
+        touches ``self.zb``, ``self.subgrid_z_zmin``, or
+        ``self.subgrid_z_zmax`` directly.
 
         Parameters
         ----------
@@ -227,8 +314,8 @@ class SfincsXmi(XmiWrapper):
         y : numpy.ndarray, optional
             Y-coordinates of the bed level change data.
         dz : numpy.ndarray, optional
-            Bed level change (m) at each (x, y) point relative to the initial
-            bed level.
+            Bed level change (m) at each (x, y) point relative to the
+            previous time step (i.e. an incremental delta).
         update_water_level : bool, optional
             If ``True``, the water surface is adjusted by the same delta.
             Defaults to ``False``.
@@ -238,36 +325,41 @@ class SfincsXmi(XmiWrapper):
         None
         """
 
-        # if x is None or y is None or z is None:
-        #     # Assume that z
-        #     return
+        if x is None or y is None or dz is None:
+            return
 
-        # New bed level change dzb
+        if not hasattr(self, "dzbext"):
+            self.get_dzbext()
+
+        # Interpolate the delta to the SFINCS grid
         dzb = interp2(x, y, dz, self.xz, self.yz)
+        dzb[np.isnan(dzb)] = 0.0
+        dzb = dzb.astype(np.float32, copy=False)
 
-        # Difference w.r.t. previous time step
-        # Make a copy of self.zb
-        zb0 = self.zb[:].copy()
-
-        # Set new bed level
-        self.zb[:] = self.zbini + dzb
-
-        # Difference w.r.t. previous time step
-        dzt = self.zb[:] - zb0
-
-        self.update_zbuv()
+        # Push to kernel and apply
+        self.dzbext[:] = dzb
+        self.update_bed_level()
 
         if update_water_level:
-            self.zs += dzt
+            self.zs += dzb
 
-    def update_zbuv(self) -> None:
-        """Update the u/v-point bed levels in the SFINCS kernel.
+        # Reset dzbext so subsequent calls start from a clean slate
+        self.dzbext[:] = 0.0
+
+    def update_bed_level(self) -> None:
+        """Apply ``self.dzbext`` to the SFINCS kernel's bed-level arrays.
+
+        For non-subgrid models this updates ``zb``; for subgrid models it
+        updates ``subgrid_z_zmin``/``subgrid_z_zmax`` (cell centres) and
+        ``subgrid_uv_zmin``/``subgrid_uv_zmax`` (uv points), with the uv zmin
+        clamped from below by the cell-centre zmin of the two neighbours.
+        ``zbuvmx`` is also recomputed for non-subgrid runs.
 
         Returns
         -------
         None
         """
-        self._execute_function(self.lib.update_zbuv)
+        self._execute_function(self.lib.update_bed_level)
 
     def update_apparent_roughness(self, uorb: np.ndarray) -> None:
         """Update the apparent roughness using the orbital velocity.
