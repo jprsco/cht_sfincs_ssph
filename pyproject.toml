@@ -27,6 +27,6 @@ dependencies = [ "numpy",
                  "cht_bathymetry@ git+https://github.com/jprsco/cht_bathymetry_ssph.git",
                  "cht_utils@ git+https://github.com/jprsco/cht_utils_ssph.git",
                  "cht_tide@ git+https://github.com/jprsco/cht_tide_ssph.git",
-                 "cht_tiling@ git+https://github.com/jprsco/cht_tiling+ssph.git",
+                 "cht_tiling@ git+https://github.com/jprsco/cht_tiling_ssph.git",
 				]
 
